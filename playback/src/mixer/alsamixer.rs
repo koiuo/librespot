@@ -24,6 +24,7 @@ pub struct AlsaMixer {
     db_range: f64,
     has_switch: bool,
     is_softvol: bool,
+    is_raw: bool,
     use_linear_in_db: bool,
 }
 
@@ -31,6 +32,15 @@ pub struct AlsaMixer {
 // its name copied verbatim from Alsa, this is in millibel scale.
 const SND_CTL_TLV_DB_GAIN_MUTE: MilliBel = MilliBel(-9999999);
 const ZERO_DB: MilliBel = MilliBel(0);
+
+// Alsa reports the dB volume range of hardware and softvol controls
+// through different APIs.
+enum ControlKind {
+    // Reports dB through the mixer API, if it reports dB at all.
+    Hardware,
+    // Alsa softvol control with its dB range from the control API.
+    Softvol(MilliBel, MilliBel),
+}
 
 #[derive(Debug, Error)]
 enum AlsaMixerError {
@@ -42,8 +52,8 @@ enum AlsaMixerError {
     CouldNotOpenWithDevice(AlsaError),
     #[error("Could not open Alsa softvol with that name. {0}")]
     CouldNotOpenWithName(NulError),
-    #[error("Could not get Alsa softvol dB range. {0}")]
-    NoDbRange(AlsaError),
+    #[error("Alsa mixer control has no dB range, use linear volume control instead of {0:?}")]
+    UnsupportedVolumeCtrl(VolumeCtrl),
     #[error("Could not convert Alsa raw volume to dB volume. {0}")]
     CouldNotConvertRaw(AlsaError),
 }
@@ -71,17 +81,19 @@ impl Mixer for AlsaMixer {
 
         // Query capabilities
         let has_switch = simple_element.has_playback_switch();
-        let is_softvol = simple_element
+        let has_hw_db = simple_element
             .get_playback_vol_db(SelemChannelId::mono())
-            .is_err();
+            .is_ok();
 
         // Query raw volume range
         let (min, max) = simple_element.get_playback_volume_range();
         let range = i64::abs(max - min);
 
-        // Query dB volume range -- note that Alsa exposes a different
-        // API for hardware and software mixers
-        let (min_millibel, max_millibel) = if is_softvol {
+        // Hardware controls report dB through the mixer API. Alsa softvol
+        // controls do not, but report their dB range through the control API.
+        let control_kind = if has_hw_db {
+            ControlKind::Hardware
+        } else {
             let control =
                 Ctl::new(&config.device, false).map_err(AlsaMixerError::CouldNotOpenWithDevice)?;
             let mut element_id = ElemId::new(ElemIface::Mixer);
@@ -90,93 +102,136 @@ impl Mixer for AlsaMixer {
                     .map_err(AlsaMixerError::CouldNotOpenWithName)?,
             );
             element_id.set_index(config.index);
-            let (min_millibel, mut max_millibel) = control
-                .get_db_range(&element_id)
-                .map_err(AlsaMixerError::NoDbRange)?;
-
-            // Alsa can report incorrect maximum volumes due to rounding
-            // errors. e.g. Alsa rounds [-60.0..0.0] in range [0..255] to
-            // step size 0.23. Then multiplying 0.23 by 255 incorrectly
-            // returns a dB range of 58.65 instead of 60 dB, from
-            // [-60.00..-1.35]. This workaround checks the default case
-            // where the maximum dB volume is expected to be 0, and cannot
-            // cover all cases.
-            if max_millibel != ZERO_DB {
-                warn!("Alsa mixer reported maximum dB != 0, which is suspect");
-                let reported_step_size = (max_millibel - min_millibel).0 / range;
-                let assumed_step_size = (ZERO_DB - min_millibel).0 / range;
-                if reported_step_size == assumed_step_size {
-                    warn!(
-                        "Alsa rounding error detected, setting maximum dB to {:.2} instead of {:.2}",
-                        ZERO_DB.to_db(),
-                        max_millibel.to_db()
-                    );
-                    max_millibel = ZERO_DB;
-                } else {
-                    warn!("Please manually set `--volume-range` if this is incorrect");
+            match control.get_db_range(&element_id) {
+                Ok((min_millibel, max_millibel)) => {
+                    ControlKind::Softvol(min_millibel, max_millibel)
                 }
+                Err(_) => ControlKind::Hardware,
             }
-            (min_millibel, max_millibel)
-        } else {
-            let (mut min_millibel, max_millibel) = simple_element.get_playback_db_range();
+        };
+        let is_softvol = matches!(control_kind, ControlKind::Softvol(..));
 
-            // Some controls report that their minimum volume is mute, instead
-            // of their actual lowest dB setting before that.
-            if min_millibel == SND_CTL_TLV_DB_GAIN_MUTE && min < max {
-                debug!("Alsa mixer reported minimum dB as mute, trying workaround");
-                min_millibel = simple_element
-                    .ask_playback_vol_db(min + 1)
-                    .map_err(AlsaMixerError::CouldNotConvertRaw)?;
+        // Query dB volume range
+        let db_range_millibel = match control_kind {
+            ControlKind::Softvol(min_millibel, mut max_millibel) => {
+                // Alsa can report incorrect maximum volumes due to rounding
+                // errors. e.g. Alsa rounds [-60.0..0.0] in range [0..255] to
+                // step size 0.23. Then multiplying 0.23 by 255 incorrectly
+                // returns a dB range of 58.65 instead of 60 dB, from
+                // [-60.00..-1.35]. This workaround checks the default case
+                // where the maximum dB volume is expected to be 0, and cannot
+                // cover all cases.
+                if max_millibel != ZERO_DB {
+                    warn!("Alsa mixer reported maximum dB != 0, which is suspect");
+                    let reported_step_size = (max_millibel - min_millibel).0 / range;
+                    let assumed_step_size = (ZERO_DB - min_millibel).0 / range;
+                    if reported_step_size == assumed_step_size {
+                        warn!(
+                            "Alsa rounding error detected, setting maximum dB to {:.2} instead of {:.2}",
+                            ZERO_DB.to_db(),
+                            max_millibel.to_db()
+                        );
+                        max_millibel = ZERO_DB;
+                    } else {
+                        warn!("Please manually set `--volume-range` if this is incorrect");
+                    }
+                }
+                Some((min_millibel, max_millibel))
             }
-            (min_millibel, max_millibel)
+            ControlKind::Hardware if has_hw_db => {
+                let (mut min_millibel, max_millibel) = simple_element.get_playback_db_range();
+
+                // Some controls report that their minimum volume is mute, instead
+                // of their actual lowest dB setting before that.
+                if min_millibel == SND_CTL_TLV_DB_GAIN_MUTE && min < max {
+                    debug!("Alsa mixer reported minimum dB as mute, trying workaround");
+                    min_millibel = simple_element
+                        .ask_playback_vol_db(min + 1)
+                        .map_err(AlsaMixerError::CouldNotConvertRaw)?;
+                }
+                Some((min_millibel, max_millibel))
+            }
+            ControlKind::Hardware => {
+                // Some hardware controls do not report a dB range at all,
+                // e.g. the PipeWire Alsa plugin.
+                None
+            }
         };
 
-        let min_db = min_millibel.to_db() as f64;
-        let max_db = max_millibel.to_db() as f64;
-        let reported_db_range = f64::abs(max_db - min_db);
+        // Without a dB range we do not know how the raw volume maps to dB.
+        // So we set the raw volume directly, with a linear mapping.
+        let is_raw = db_range_millibel.is_none();
 
-        // Synchronize the volume control dB range with the mixer control,
-        // unless it was already set with a command line option.
-        let db_range = if config.volume_ctrl.range_ok() {
-            let db_range_override = config.volume_ctrl.db_range();
-            if db_range_override.is_normal() {
-                db_range_override
+        let (min_db, max_db, db_range, use_linear_in_db) =
+            if let Some((min_millibel, max_millibel)) = db_range_millibel {
+                let min_db = min_millibel.to_db() as f64;
+                let max_db = max_millibel.to_db() as f64;
+                let reported_db_range = f64::abs(max_db - min_db);
+
+                // Synchronize the volume control dB range with the mixer control,
+                // unless it was already set with a command line option.
+                let db_range = if config.volume_ctrl.range_ok() {
+                    let db_range_override = config.volume_ctrl.db_range();
+                    if db_range_override.is_normal() {
+                        db_range_override
+                    } else {
+                        reported_db_range
+                    }
+                } else {
+                    config.volume_ctrl.set_db_range(reported_db_range);
+                    reported_db_range
+                };
+
+                if reported_db_range == db_range {
+                    debug!("Alsa dB volume range was reported as {}", reported_db_range);
+                    if reported_db_range > 100.0 {
+                        debug!("Alsa mixer reported dB range > 100, which is suspect");
+                        debug!("Please manually set `--volume-range` if this is incorrect");
+                    }
+                } else {
+                    debug!(
+                        "Alsa dB volume range was reported as {} but overridden to {}",
+                        reported_db_range, db_range
+                    );
+                }
+
+                // For hardware controls with a small range (24 dB or less),
+                // force using the dB API with a linear mapping.
+                let mut use_linear_in_db = false;
+                if !is_softvol && db_range <= 24.0 {
+                    use_linear_in_db = true;
+                    config.volume_ctrl = VolumeCtrl::Linear;
+                }
+
+                (min_db, max_db, db_range, use_linear_in_db)
             } else {
-                reported_db_range
-            }
-        } else {
-            config.volume_ctrl.set_db_range(reported_db_range);
-            reported_db_range
-        };
-
-        if reported_db_range == db_range {
-            debug!("Alsa dB volume range was reported as {}", reported_db_range);
-            if reported_db_range > 100.0 {
-                debug!("Alsa mixer reported dB range > 100, which is suspect");
-                debug!("Please manually set `--volume-range` if this is incorrect");
-            }
-        } else {
-            debug!(
-                "Alsa dB volume range was reported as {} but overridden to {}",
-                reported_db_range, db_range
-            );
-        }
-
-        // For hardware controls with a small range (24 dB or less),
-        // force using the dB API with a linear mapping.
-        let mut use_linear_in_db = false;
-        if !is_softvol && db_range <= 24.0 {
-            use_linear_in_db = true;
-            config.volume_ctrl = VolumeCtrl::Linear;
-        }
+                match config.volume_ctrl {
+                    VolumeCtrl::Linear | VolumeCtrl::Fixed => (),
+                    // The dB range was not set with a command line option, so
+                    // the volume control was not chosen by the user either.
+                    _ if !config.volume_ctrl.range_ok() => {
+                        info!("Alsa mixer control has no dB range, using linear volume control");
+                        config.volume_ctrl = VolumeCtrl::Linear;
+                    }
+                    _ => {
+                        return Err(
+                            AlsaMixerError::UnsupportedVolumeCtrl(config.volume_ctrl).into()
+                        );
+                    }
+                }
+                (0.0, 0.0, config.volume_ctrl.db_range(), false)
+            };
 
         debug!("Alsa mixer control is softvol: {}", is_softvol);
+        debug!("Alsa mixer control has no dB range: {}", is_raw);
         debug!("Alsa support for playback (mute) switch: {}", has_switch);
         debug!("Alsa raw volume range: [{}..{}] ({})", min, max, range);
-        debug!(
-            "Alsa dB volume range: [{:.2}..{:.2}] ({:.2})",
-            min_db, max_db, db_range
-        );
+        if !is_raw {
+            debug!(
+                "Alsa dB volume range: [{:.2}..{:.2}] ({:.2})",
+                min_db, max_db, db_range
+            );
+        }
         debug!("Alsa forcing linear dB mapping: {}", use_linear_in_db);
 
         Ok(Self {
@@ -189,6 +244,7 @@ impl Mixer for AlsaMixer {
             db_range,
             has_switch,
             is_softvol,
+            is_raw,
             use_linear_in_db,
         })
     }
@@ -204,7 +260,7 @@ impl Mixer for AlsaMixer {
             return 0;
         }
 
-        let mut mapped_volume = if self.is_softvol {
+        let mut mapped_volume = if self.is_softvol || self.is_raw {
             let raw_volume = simple_element
                 .get_playback_volume(SelemChannelId::mono())
                 .expect("Could not get raw Alsa volume");
@@ -266,7 +322,7 @@ impl Mixer for AlsaMixer {
             mapped_volume = LogMapping::mapped_to_linear(mapped_volume, self.db_range);
         }
 
-        if self.is_softvol {
+        if self.is_softvol || self.is_raw {
             let scaled_volume = mapped_to_raw(mapped_volume, self.min, self.range);
             debug!("Setting Alsa raw volume to {}", scaled_volume);
             simple_element
